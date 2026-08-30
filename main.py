@@ -2,6 +2,7 @@
 
 import threading
 from datetime import datetime, date
+import calendar as pycalendar
 from pathlib import Path
 from queue import Queue, Empty
 from typing import Any, Iterable
@@ -13,7 +14,7 @@ import customtkinter as ctk
 import gspread
 import pandas as pd
 from google.oauth2.service_account import Credentials
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 import sys
 from pathlib import Path
 
@@ -46,7 +47,8 @@ def resource_path(filename: str) -> Path:
 def normalize_text(value: Any) -> str:
     if value is None:
         return ""
-    return " ".join(str(value).strip().split()).upper()
+    text = " ".join(str(value).strip().split()).upper()
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
 
 
 
@@ -195,6 +197,16 @@ def unique_display_values(series: pd.Series) -> list[str]:
     return sorted(seen.values(), key=normalize_search_text)
 
 
+def entry_filter_text(entry: Any | None, variable: Any | None) -> str:
+    if entry is not None and getattr(entry, "_placeholder_active", False):
+        return ""
+    text = safe_string(variable.get()) if variable is not None else ""
+    placeholder = safe_string(getattr(entry, "_placeholder_text", ""))
+    if placeholder and normalize_search_text(text) == normalize_search_text(placeholder):
+        return ""
+    return text
+
+
 _CALENDAR_CLASS: Any | None = None
 
 
@@ -205,6 +217,288 @@ def get_calendar_class() -> Any:
 
         _CALENDAR_CLASS = Calendar
     return _CALENDAR_CLASS
+
+
+class DateRangePicker:
+    def __init__(
+        self,
+        master: Any,
+        *,
+        title: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        active_target: str = "from",
+    ) -> None:
+        self.top = ctk.CTkToplevel(master)
+        self.top.title(title)
+        self.top.geometry("500x560")
+        self.top.minsize(500, 560)
+        self.top.resizable(False, False)
+        self.top.grab_set()
+        self.top.transient(master)
+        self.top.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        self.result: tuple[date | None, date | None] | None = None
+        self.active_target = active_target if active_target in {"from", "to"} else "from"
+        self.selected_from = start_date
+        self.selected_to = end_date
+        if self.selected_from and self.selected_to and self.selected_to < self.selected_from:
+            self.selected_from, self.selected_to = self.selected_to, self.selected_from
+
+        seed = self.selected_from or self.selected_to or date.today()
+        self.current_year = seed.year
+        self.current_month = seed.month
+
+        self._build_ui(title)
+        self._render_calendar()
+        self._sync_summary()
+
+    def _build_ui(self, title: str) -> None:
+        container = ctk.CTkFrame(self.top, corner_radius=18, fg_color="#ffffff")
+        container.pack(fill="both", expand=True, padx=16, pady=16)
+        container.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            container,
+            text=title,
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color="#1d4ed8",
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
+
+        summary = ctk.CTkFrame(container, fg_color="transparent")
+        summary.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+        summary.grid_columnconfigure(0, weight=1)
+        summary.grid_columnconfigure(1, weight=1)
+
+        self.from_label = ctk.CTkLabel(summary, text="Desde: -", text_color="#0f172a")
+        self.from_label.grid(row=0, column=0, sticky="w")
+        self.to_label = ctk.CTkLabel(summary, text="Hasta: -", text_color="#0f172a")
+        self.to_label.grid(row=0, column=1, sticky="e")
+
+        target_row = ctk.CTkFrame(container, fg_color="transparent")
+        target_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
+        target_row.grid_columnconfigure(0, weight=1)
+        target_row.grid_columnconfigure(1, weight=1)
+
+        self.from_target_button = ctk.CTkButton(
+            target_row,
+            text="Editar desde",
+            command=lambda: self._set_active_target("from"),
+            corner_radius=12,
+            height=32,
+        )
+        self.from_target_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        self.to_target_button = ctk.CTkButton(
+            target_row,
+            text="Editar hasta",
+            command=lambda: self._set_active_target("to"),
+            corner_radius=12,
+            height=32,
+        )
+        self.to_target_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        nav_row = ctk.CTkFrame(container, fg_color="transparent")
+        nav_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 10))
+        nav_row.grid_columnconfigure(0, weight=0)
+        nav_row.grid_columnconfigure(1, weight=1)
+        nav_row.grid_columnconfigure(2, weight=0)
+
+        ctk.CTkButton(
+            nav_row,
+            text="◀",
+            command=self.prev_month,
+            width=42,
+            height=32,
+            corner_radius=12,
+        ).grid(row=0, column=0, sticky="w")
+
+        self.month_label = ctk.CTkLabel(nav_row, text="", font=ctk.CTkFont(size=14, weight="bold"), text_color="#0f172a")
+        self.month_label.grid(row=0, column=1, sticky="ew")
+
+        ctk.CTkButton(
+            nav_row,
+            text="▶",
+            command=self.next_month,
+            width=42,
+            height=32,
+            corner_radius=12,
+        ).grid(row=0, column=2, sticky="e")
+
+        self.calendar_frame = ctk.CTkFrame(container, corner_radius=14, fg_color="#f8fafc")
+        self.calendar_frame.grid(row=4, column=0, sticky="nsew", padx=16, pady=(0, 10))
+        for col in range(7):
+            self.calendar_frame.grid_columnconfigure(col, weight=1)
+
+        footer = ctk.CTkFrame(container, fg_color="transparent")
+        footer.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 16))
+        footer.grid_columnconfigure(0, weight=1)
+        footer.grid_columnconfigure(1, weight=1)
+        footer.grid_columnconfigure(2, weight=1)
+
+        ctk.CTkButton(
+            footer,
+            text="Limpiar",
+            fg_color="#e2e8f0",
+            hover_color="#cbd5e1",
+            text_color="#0f172a",
+            command=self.clear,
+            corner_radius=12,
+            height=34,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        ctk.CTkButton(
+            footer,
+            text="Cancelar",
+            fg_color="#e2e8f0",
+            hover_color="#cbd5e1",
+            text_color="#0f172a",
+            command=self.cancel,
+            corner_radius=12,
+            height=34,
+        ).grid(row=0, column=1, sticky="ew", padx=6)
+
+        ctk.CTkButton(
+            footer,
+            text="Aplicar",
+            command=self.apply,
+            corner_radius=12,
+            height=34,
+        ).grid(row=0, column=2, sticky="ew", padx=(6, 0))
+
+    def _set_active_target(self, target: str) -> None:
+        self.active_target = target
+        self._render_calendar()
+        self._sync_summary()
+
+    def _month_name(self, month: int) -> str:
+        months = [
+            "Enero",
+            "Febrero",
+            "Marzo",
+            "Abril",
+            "Mayo",
+            "Junio",
+            "Julio",
+            "Agosto",
+            "Septiembre",
+            "Octubre",
+            "Noviembre",
+            "Diciembre",
+        ]
+        return months[month - 1]
+
+    def _sync_summary(self) -> None:
+        self.from_label.configure(text=f"Desde: {self.selected_from.strftime('%d/%m/%Y') if self.selected_from else '-'}")
+        self.to_label.configure(text=f"Hasta: {self.selected_to.strftime('%d/%m/%Y') if self.selected_to else '-'}")
+        self.from_target_button.configure(
+            fg_color="#1d4ed8" if self.active_target == "from" else "#e2e8f0",
+            text_color="#ffffff" if self.active_target == "from" else "#0f172a",
+        )
+        self.to_target_button.configure(
+            fg_color="#1d4ed8" if self.active_target == "to" else "#e2e8f0",
+            text_color="#ffffff" if self.active_target == "to" else "#0f172a",
+        )
+
+    def _render_calendar(self) -> None:
+        for child in self.calendar_frame.winfo_children():
+            child.destroy()
+
+        self.month_label.configure(text=f"{self._month_name(self.current_month)} {self.current_year}")
+
+        weekdays = ["Lu", "Ma", "Mi", "Ju", "Vi", "Sa", "Do"]
+        for col, label in enumerate(weekdays):
+            ctk.CTkLabel(
+                self.calendar_frame,
+                text=label,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color="#1d4ed8",
+            ).grid(row=0, column=col, sticky="ew", padx=4, pady=(8, 6))
+
+        weeks = pycalendar.monthcalendar(self.current_year, self.current_month)
+        first_weekday, days_in_month = pycalendar.monthrange(self.current_year, self.current_month)
+        for row_index, week in enumerate(weeks, start=1):
+            for col_index, day_number in enumerate(week):
+                if day_number == 0:
+                    placeholder = ctk.CTkLabel(self.calendar_frame, text="", fg_color="#f8fafc")
+                    placeholder.grid(row=row_index, column=col_index, sticky="nsew", padx=4, pady=4)
+                    continue
+
+                current_date = date(self.current_year, self.current_month, day_number)
+                selected = self.selected_from and self.selected_to and self.selected_from <= current_date <= self.selected_to
+                is_boundary = current_date == self.selected_from or current_date == self.selected_to
+                fg_color = "#1d4ed8" if is_boundary else "#dbeafe" if selected else "#ffffff"
+                text_color = "#ffffff" if is_boundary else "#0f172a"
+                hover_color = "#3b82f6" if is_boundary else "#bfdbfe"
+
+                ctk.CTkButton(
+                    self.calendar_frame,
+                    text=str(day_number),
+                    command=lambda d=current_date: self._pick_date(d),
+                    width=42,
+                    height=34,
+                    corner_radius=10,
+                    fg_color=fg_color,
+                    hover_color=hover_color,
+                    text_color=text_color,
+                ).grid(row=row_index, column=col_index, sticky="nsew", padx=4, pady=4)
+
+    def _pick_date(self, picked: date) -> None:
+        if self.active_target == "from":
+            self.selected_from = picked
+            if self.selected_to is not None and self.selected_to < self.selected_from:
+                self.selected_to = None
+            self.active_target = "to"
+        else:
+            if self.selected_from is None:
+                self.selected_from = picked
+            elif picked < self.selected_from:
+                self.selected_to = self.selected_from
+                self.selected_from = picked
+                self.active_target = "from"
+            else:
+                self.selected_to = picked
+                self.active_target = "from"
+
+        self._sync_summary()
+        self._render_calendar()
+
+    def prev_month(self) -> None:
+        if self.current_month == 1:
+            self.current_month = 12
+            self.current_year -= 1
+        else:
+            self.current_month -= 1
+        self._render_calendar()
+
+    def next_month(self) -> None:
+        if self.current_month == 12:
+            self.current_month = 1
+            self.current_year += 1
+        else:
+            self.current_month += 1
+        self._render_calendar()
+
+    def clear(self) -> None:
+        self.selected_from = None
+        self.selected_to = None
+        self.active_target = "from"
+        self._sync_summary()
+        self._render_calendar()
+
+    def apply(self) -> None:
+        if self.selected_from and self.selected_to and self.selected_to < self.selected_from:
+            self.selected_from, self.selected_to = self.selected_to, self.selected_from
+        self.result = (self.selected_from, self.selected_to)
+        self.top.destroy()
+
+    def cancel(self) -> None:
+        self.result = None
+        self.top.destroy()
+
+    def show(self) -> tuple[date | None, date | None] | None:
+        self.top.wait_window()
+        return self.result
 
 
 class AutocompletePopup:
@@ -1014,55 +1308,22 @@ class DataPanel(ctk.CTkFrame):
     def _open_calendar(self, target: str) -> None:
         if self.date_filter_label is None:
             return
+        picker = DateRangePicker(
+            self,
+            title=self.date_filter_label,
+            start_date=self.selected_date_from,
+            end_date=self.selected_date_to,
+            active_target=target,
+        )
+        result = picker.show()
+        if result is None:
+            return
 
-        from tkcalendar import Calendar
-
-        top = ctk.CTkToplevel(self)
-        top.title(self.date_filter_label)
-        top.geometry("360x380")
-        top.resizable(False, False)
-        top.grab_set()
-
-        container = ctk.CTkFrame(top, corner_radius=18, fg_color="#ffffff")
-        container.pack(fill="both", expand=True, padx=16, pady=16)
-
-        ctk.CTkLabel(
-            container,
-            text=f"{self.date_filter_label} - {'Desde' if target == 'from' else 'Hasta'}",
-            font=ctk.CTkFont(size=15, weight="bold"),
-            text_color="#1d4ed8",
-        ).pack(anchor="w", padx=14, pady=(14, 10))
-
-        cal = Calendar(container, selectmode="day", date_pattern="dd/mm/yyyy")
-        cal.pack(padx=14, pady=(0, 12), fill="both", expand=True)
-
-        button_row = ctk.CTkFrame(container, fg_color="transparent")
-        button_row.pack(fill="x", padx=14, pady=(0, 14))
-
-        def apply_date(_event: Any | None = None) -> None:
-            selected_date = cal.selection_get()
-            if target == "from":
-                self.selected_date_from = selected_date
-                self.date_from_var.set(selected_date.strftime("%d/%m/%Y"))
-            else:
-                self.selected_date_to = selected_date
-                self.date_to_var.set(selected_date.strftime("%d/%m/%Y"))
-            top.destroy()
-            self._apply_visible_filter()
-            self.refresh_data()
-
-        cal.bind("<<CalendarSelected>>", apply_date)
-
-        ctk.CTkButton(
-            button_row,
-            text="Cancelar",
-            fg_color="#e2e8f0",
-            hover_color="#cbd5e1",
-            text_color="#0f172a",
-            command=top.destroy,
-            corner_radius=14,
-            height=38,
-        ).pack(fill="x")
+        self.selected_date_from, self.selected_date_to = result
+        self.date_from_var.set(self.selected_date_from.strftime("%d/%m/%Y") if self.selected_date_from else "Todas")
+        self.date_to_var.set(self.selected_date_to.strftime("%d/%m/%Y") if self.selected_date_to else "Todas")
+        self._apply_visible_filter()
+        self.refresh_data()
 
     def _set_filter(self, value: str) -> None:
         self.name_var.set(value)
@@ -1198,7 +1459,9 @@ class DataPanel(ctk.CTkFrame):
             variable = spec.get("variable")
             if variable is None:
                 continue
-            selected = safe_string(variable.get()).strip()
+            widget = spec.get("widget")
+            entry = widget.entry if hasattr(widget, "entry") else widget
+            selected = entry_filter_text(entry, variable).strip()
             if not selected or normalize_text(selected) == "TODOS":
                 continue
             column_values = df.iloc[:, int(column_index)].map(normalize_text)
@@ -1208,7 +1471,7 @@ class DataPanel(ctk.CTkFrame):
                 query = normalize_search_text(selected)
                 df = df.loc[column_values.str.contains(query, na=False)].copy()
 
-        query = self.search_var.get().strip().lower()
+        query = entry_filter_text(getattr(self, "search_entry", None), self.search_var).strip().lower()
         if query:
             mask = df.astype(str).apply(lambda col: col.str.lower().str.contains(query, na=False))
             df = df.loc[mask.any(axis=1)].copy()
@@ -1660,53 +1923,22 @@ class RegistrosPanel(ctk.CTkFrame):
         self._apply_visible_filter()
 
     def _open_calendar(self, target: str) -> None:
-        Calendar = get_calendar_class()
+        picker = DateRangePicker(
+            self,
+            title="Fecha de Venta",
+            start_date=self.selected_date_from,
+            end_date=self.selected_date_to,
+            active_target=target,
+        )
+        result = picker.show()
+        if result is None:
+            return
 
-        top = ctk.CTkToplevel(self)
-        top.title("Fecha de Venta")
-        top.geometry("360x380")
-        top.resizable(False, False)
-        top.grab_set()
-
-        container = ctk.CTkFrame(top, corner_radius=18, fg_color="#ffffff")
-        container.pack(fill="both", expand=True, padx=16, pady=16)
-
-        ctk.CTkLabel(
-            container,
-            text=f"Fecha de Venta - {'Desde' if target == 'from' else 'Hasta'}",
-            font=ctk.CTkFont(size=15, weight="bold"),
-            text_color="#1d4ed8",
-        ).pack(anchor="w", padx=14, pady=(14, 10))
-
-        cal = Calendar(container, selectmode="day", date_pattern="dd/mm/yyyy")
-        cal.pack(padx=14, pady=(0, 12), fill="both", expand=True)
-
-        button_row = ctk.CTkFrame(container, fg_color="transparent")
-        button_row.pack(fill="x", padx=14, pady=(0, 14))
-
-        def apply_date(_event: Any | None = None) -> None:
-            selected_date = cal.selection_get()
-            if target == "from":
-                self.selected_date_from = selected_date
-                self.date_from_var.set(selected_date.strftime("%d/%m/%Y"))
-            else:
-                self.selected_date_to = selected_date
-                self.date_to_var.set(selected_date.strftime("%d/%m/%Y"))
-            top.destroy()
-            self._apply_visible_filter()
-
-        cal.bind("<<CalendarSelected>>", apply_date)
-
-        ctk.CTkButton(
-            button_row,
-            text="Cancelar",
-            fg_color="#e2e8f0",
-            hover_color="#cbd5e1",
-            text_color="#0f172a",
-            command=top.destroy,
-            corner_radius=14,
-            height=38,
-        ).pack(fill="x")
+        self.selected_date_from, self.selected_date_to = result
+        self.date_from_var.set(self.selected_date_from.strftime("%d/%m/%Y") if self.selected_date_from else "Todas")
+        self.date_to_var.set(self.selected_date_to.strftime("%d/%m/%Y") if self.selected_date_to else "Todas")
+        self._apply_visible_filter()
+        self.refresh_data()
 
     def refresh_data(self) -> None:
         self.refresh_button.configure(state="disabled", text="Cargando...")
@@ -1854,9 +2086,9 @@ class RegistrosPanel(ctk.CTkFrame):
         if selected_representative and selected_representative != "TODOS" and len(df.columns) > 1:
             df = df.loc[df.iloc[:, 1].map(normalize_text) == selected_representative].copy()
 
-        df = apply_text_filter(df, 2, self.client_var.get())
-        df = apply_text_filter(df, 5, self.brand_var.get())
-        df = apply_text_filter(df, 11, self.line_var.get())
+        df = apply_text_filter(df, 2, entry_filter_text(getattr(self.client_popup, "entry", None), self.client_var))
+        df = apply_text_filter(df, 5, entry_filter_text(getattr(self.brand_popup, "entry", None), self.brand_var))
+        df = apply_text_filter(df, 11, entry_filter_text(getattr(self.line_popup, "entry", None), self.line_var))
 
         selected_confidence = normalize_text(self.confidence_var.get())
         if selected_confidence and selected_confidence != "TODOS" and len(df.columns) > 10:
@@ -1871,7 +2103,7 @@ class RegistrosPanel(ctk.CTkFrame):
                 mask &= parsed_dates <= self.selected_date_to
             df = df.loc[mask].copy()
 
-        query = self.search_var.get().strip().lower()
+        query = entry_filter_text(getattr(self, "search_entry", None), self.search_var).strip().lower()
         if query:
             mask = df.astype(str).apply(lambda col: col.str.lower().str.contains(query, na=False))
             df = df.loc[mask.any(axis=1)].copy()
