@@ -2159,6 +2159,216 @@ class RegistrosPanel(ctk.CTkFrame):
         self.status_var.set(f"Fila seleccionada: {snippet}")
 
 
+CRONOGRAMA_REPRESENTATIVES = {
+    "70321862": "ERIKA UCHUYA TROCONES",
+    "70122639": "JAVIER KLUIVERT CONDOR SANCHEZ",
+    "71406087": "Ximena Jamilet Montoya Calderon",
+}
+
+
+def prepare_cronograma_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    columns = ["DNI", "Representante", "Cliente", "Tipo de visita", "Fecha"]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    if len(df.columns) < 5:
+        raise ValueError("La hoja Cronograma debe contener las columnas A a E: DNI, Cliente, Tipo de visita, Fecha y Borrado.")
+    result = df.iloc[:, :5].copy()
+    result.columns = ["DNI", "Cliente", "Tipo de visita", "Fecha", "Borrado"]
+    result["DNI"] = result["DNI"].map(safe_string)
+    result = result.loc[
+        result["DNI"].isin(CRONOGRAMA_REPRESENTATIVES)
+        & result["Borrado"].map(normalize_text).ne("SI")
+    ].copy()
+    result["Representante"] = result["DNI"].map(CRONOGRAMA_REPRESENTATIVES)
+    for column in ("Cliente", "Tipo de visita"):
+        result[column] = result[column].map(safe_string)
+    # Parse each cell independently to support mixed sheet date formats.
+    result["Fecha"] = result["Fecha"].map(
+        lambda value: pd.to_datetime(value, errors="coerce", dayfirst=True).date()
+        if safe_string(value) else pd.NaT
+    )
+    return result.loc[result["Fecha"].notna(), columns].reset_index(drop=True)
+
+
+class CronogramaPanel(ctk.CTkFrame):
+    MONTHS = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+              "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
+
+    def __init__(self, master: Any) -> None:
+        super().__init__(master, fg_color="#ffffff")
+        self.selected_date = date.today()
+        self.month = self.selected_date.replace(day=1)
+        self.base_df = prepare_cronograma_dataframe(pd.DataFrame())
+        self.filtered_df = self.base_df.copy()
+        self.queue: Queue = Queue()
+        self.busy = False
+        self.loaded = False
+        self.representative_var = tk.StringVar(value="Todos")
+        self.client_var = tk.StringVar()
+        self.visit_type_var = tk.StringVar(value="Todos")
+        self.status_var = tk.StringVar(value="Selecciona Actualizar datos para consultar Cronograma.")
+        self.month_var = tk.StringVar()
+        self.detail_var = tk.StringVar()
+        self._build_ui()
+        for variable in (self.representative_var, self.client_var, self.visit_type_var):
+            variable.trace_add("write", lambda *_: self._apply_filters())
+        self._apply_filters()
+        self.after(120, self._poll_queue)
+
+    def _build_ui(self) -> None:
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(4, weight=1)
+        header = ctk.CTkFrame(self, fg_color="#ffffff")
+        header.grid(row=0, column=0, sticky="ew", padx=16, pady=10)
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(header, text="Cronograma", font=("Segoe UI", 20, "bold")).grid(row=0, column=0, sticky="w")
+        self.refresh_button = ctk.CTkButton(header, text="Actualizar datos", command=self.refresh_data)
+        self.refresh_button.grid(row=0, column=1)
+        filters = ctk.CTkFrame(self, fg_color="#f8fafc")
+        filters.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
+        for col in range(3):
+            filters.grid_columnconfigure(col, weight=1)
+        for col, label in enumerate(("Representante", "Cliente", "Tipo de visita")):
+            ctk.CTkLabel(filters, text=label).grid(row=0, column=col, sticky="w", padx=8, pady=4)
+        self.representative_labels = {f"{dni} - {name}": dni for dni, name in CRONOGRAMA_REPRESENTATIVES.items()}
+        ttk.Combobox(filters, textvariable=self.representative_var, state="readonly", width=43,
+                     values=["Todos", *self.representative_labels]).grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        client_entry = ctk.CTkEntry(filters, textvariable=self.client_var)
+        client_entry.grid(row=1, column=1, sticky="ew", padx=8, pady=(0, 8))
+        self.client_popup = AutocompletePopup(client_entry, variable=self.client_var)
+        self.type_combo = ttk.Combobox(filters, textvariable=self.visit_type_var, state="readonly", values=["Todos"])
+        self.type_combo.grid(row=1, column=2, sticky="ew", padx=8, pady=(0, 8))
+        ctk.CTkButton(filters, text="Limpiar filtros", command=self._clear_filters).grid(row=1, column=3, padx=8, pady=(0, 8))
+        calendar_container = ctk.CTkFrame(self, fg_color="#f8fafc")
+        calendar_container.grid(row=2, column=0, sticky="ew", padx=16)
+        calendar_container.grid_columnconfigure(1, weight=1)
+        ctk.CTkButton(calendar_container, text="‹", width=45, command=lambda: self._move_month(-1)).grid(row=0, column=0, padx=8, pady=6)
+        ctk.CTkLabel(calendar_container, textvariable=self.month_var, font=("Segoe UI", 15, "bold")).grid(row=0, column=1)
+        ctk.CTkButton(calendar_container, text="Hoy", width=65, command=self._today).grid(row=0, column=2, padx=4)
+        ctk.CTkButton(calendar_container, text="›", width=45, command=lambda: self._move_month(1)).grid(row=0, column=3, padx=8)
+        self.calendar_frame = ctk.CTkFrame(calendar_container, fg_color="#f8fafc")
+        self.calendar_frame.grid(row=1, column=0, columnspan=4, sticky="ew", padx=8, pady=(0, 8))
+        for col in range(7):
+            self.calendar_frame.grid_columnconfigure(col, weight=1, uniform="day")
+        ctk.CTkLabel(self, textvariable=self.detail_var, font=("Segoe UI", 13, "bold")).grid(row=3, column=0, sticky="w", padx=16, pady=8)
+        table_frame = ctk.CTkFrame(self, fg_color="#ffffff")
+        table_frame.grid(row=4, column=0, sticky="nsew", padx=16)
+        table_frame.grid_columnconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(0, weight=1)
+        columns = ("Representante", "Cliente", "Tipo de visita", "Fecha")
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings")
+        for column, width in zip(columns, (340, 320, 200, 110)):
+            self.tree.heading(column, text=column)
+            self.tree.column(column, width=width, minwidth=90)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.tree.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
+        ctk.CTkLabel(self, textvariable=self.status_var).grid(row=5, column=0, sticky="w", padx=16, pady=6)
+
+    def _clear_filters(self) -> None:
+        self.representative_var.set("Todos")
+        self.client_var.set("")
+        self.visit_type_var.set("Todos")
+
+    def _apply_filters(self) -> None:
+        result = self.base_df
+        dni = self.representative_labels.get(self.representative_var.get())
+        if dni:
+            result = result.loc[result["DNI"].eq(dni)]
+        client = normalize_search_text(self.client_var.get())
+        if client:
+            result = result.loc[result["Cliente"].map(normalize_search_text).str.contains(client, regex=False)]
+        visit_type = self.visit_type_var.get()
+        if visit_type != "Todos":
+            result = result.loc[result["Tipo de visita"].map(normalize_text).eq(normalize_text(visit_type))]
+        self.filtered_df = result
+        self._render_calendar()
+        self._render_detail()
+
+    def _render_calendar(self) -> None:
+        self.month_var.set(f"{self.MONTHS[self.month.month - 1]} {self.month.year}")
+        for child in self.calendar_frame.winfo_children():
+            child.destroy()
+        for col, name in enumerate(("Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom")):
+            ctk.CTkLabel(self.calendar_frame, text=name).grid(row=0, column=col, sticky="ew")
+        counts = self.filtered_df["Fecha"].value_counts().to_dict()
+        weeks = pycalendar.monthcalendar(self.month.year, self.month.month)
+        for row, week in enumerate(weeks, 1):
+            for col, day in enumerate(week):
+                if not day:
+                    continue
+                picked = self.month.replace(day=day)
+                count = counts.get(picked, 0)
+                selected = picked == self.selected_date
+                text = f"{day}" + (f" · {count} visita{'s' if count != 1 else ''}" if count else "")
+                ctk.CTkButton(self.calendar_frame, text=text, height=30,
+                              fg_color="#1d4ed8" if selected else ("#dbeafe" if count else "#ffffff"),
+                              text_color="#ffffff" if selected else "#0f172a",
+                              command=lambda value=picked: self._select_day(value)).grid(row=row, column=col, sticky="ew", padx=2, pady=2)
+
+    def _render_detail(self) -> None:
+        rows = self.filtered_df.loc[self.filtered_df["Fecha"].eq(self.selected_date)]
+        self.detail_var.set(f"Visitas del {self.selected_date:%d/%m/%Y}: {len(rows)}" + (" — Sin visitas programadas" if rows.empty else ""))
+        self.tree.delete(*self.tree.get_children())
+        for _, row in rows.iterrows():
+            self.tree.insert("", "end", values=(row["Representante"], row["Cliente"], row["Tipo de visita"], row["Fecha"].strftime("%d/%m/%Y")))
+
+    def _select_day(self, picked: date) -> None:
+        self.selected_date = picked
+        self._render_calendar()
+        self._render_detail()
+
+    def _move_month(self, offset: int) -> None:
+        index = self.month.year * 12 + self.month.month - 1 + offset
+        self.month = date(index // 12, index % 12 + 1, 1)
+        self._select_day(self.month)
+
+    def _today(self) -> None:
+        self.month = date.today().replace(day=1)
+        self._select_day(date.today())
+
+    def refresh_data(self) -> None:
+        if self.busy:
+            return
+        self.busy = True
+        self.refresh_button.configure(state="disabled", text="Cargando...")
+        self.status_var.set("Consultando la hoja Cronograma...")
+        threading.Thread(target=self._load_async, daemon=True).start()
+
+    def _load_async(self) -> None:
+        try:
+            data, _ = load_sheet_data("Cronograma", filter_col_index=0, allowed_values=CRONOGRAMA_REPRESENTATIVES)
+            self.queue.put(("data", prepare_cronograma_dataframe(data)))
+        except Exception as exc:
+            self.queue.put(("error", exc))
+
+    def _poll_queue(self) -> None:
+        try:
+            kind, payload = self.queue.get_nowait()
+            self.busy = False
+            self.refresh_button.configure(state="normal", text="Actualizar datos")
+            if kind == "data":
+                self.base_df = payload
+                self.loaded = True
+                self.client_popup.set_options(unique_display_values(payload["Cliente"]))
+                types = ["Todos", *unique_display_values(payload["Tipo de visita"])]
+                self.type_combo.configure(values=types)
+                if self.visit_type_var.get() not in types:
+                    self.visit_type_var.set("Todos")
+                self._apply_filters()
+                self.status_var.set(f"{len(payload)} visitas programadas · Actualizado {datetime.now():%d/%m/%Y %H:%M}")
+            else:
+                self.status_var.set("No se pudo actualizar Cronograma. Los datos visibles corresponden a la última carga.")
+                messagebox.showerror("Error al consultar Cronograma", str(payload))
+        except Empty:
+            pass
+        finally:
+            self.after(120, self._poll_queue)
+
+
 class ConsultaApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
@@ -2229,6 +2439,10 @@ class ConsultaApp(ctk.CTk):
             corner_radius=12,
         )
         self.visitas_tab_button.grid(row=0, column=1, sticky="w", padx=(6, 0), pady=0)
+        self.cronograma_tab_button = ctk.CTkButton(
+            tab_bar, text="Cronograma", command=lambda: self._show_panel("cronograma"), height=30, corner_radius=12,
+        )
+        self.cronograma_tab_button.grid(row=0, column=2, padx=(12, 0))
 
         self.content = ctk.CTkFrame(self, corner_radius=22, fg_color="#ffffff")
         self.content.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
@@ -2294,17 +2508,22 @@ class ConsultaApp(ctk.CTk):
         )
         self.registros_panel.grid(row=0, column=0, sticky="nsew")
         self.visitas_panel.grid(row=0, column=0, sticky="nsew")
+        self.cronograma_panel = CronogramaPanel(self.content)
+        self.cronograma_panel.grid(row=0, column=0, sticky="nsew")
         self._show_panel("registros")
 
     def _show_panel(self, name: str) -> None:
-        if name == "registros":
-            self.registros_panel.tkraise()
-            self.registry_tab_button.configure(fg_color="#1d4ed8", text_color="#ffffff")
-            self.visitas_tab_button.configure(fg_color="#e2e8f0", text_color="#0f172a")
-        else:
-            self.visitas_panel.tkraise()
-            self.visitas_tab_button.configure(fg_color="#1d4ed8", text_color="#ffffff")
-            self.registry_tab_button.configure(fg_color="#e2e8f0", text_color="#0f172a")
+        panels = {
+            "registros": (self.registros_panel, self.registry_tab_button),
+            "visitas": (self.visitas_panel, self.visitas_tab_button),
+            "cronograma": (self.cronograma_panel, self.cronograma_tab_button),
+        }
+        panels[name][0].tkraise()
+        for key, (_, button) in panels.items():
+            button.configure(fg_color="#1d4ed8" if key == name else "#e2e8f0",
+                             text_color="#ffffff" if key == name else "#0f172a")
+        if name == "cronograma" and not self.cronograma_panel.loaded:
+            self.cronograma_panel.refresh_data()
 
 if __name__ == "__main__":
     app = ConsultaApp()
