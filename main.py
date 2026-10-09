@@ -9,11 +9,18 @@ from typing import Any, Iterable
 import tkinter as tk
 import unicodedata
 import textwrap
+import ssl
+import tempfile
+from functools import lru_cache
 
 import customtkinter as ctk
 import gspread
 import pandas as pd
 from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import AuthorizedSession, Request
+from google.auth.exceptions import TransportError
+from requests.exceptions import Timeout, ConnectionError as RequestsConnectionError
+import requests
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import sys
 from pathlib import Path
@@ -28,6 +35,7 @@ ALLOWED_NAMES = [
     "ERIKA UCHUYA TROCONES",
     "JAVIER KLUIVERT CONDOR SANCHEZ",
     "Ximena Jamilet Montoya Calderon",
+    "Naomy Desyree Rivas Cubillas",
 ]
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 HIDDEN_COLUMN_INDICES = {0, 3, 7, 12, 14, 15, 16, 17, 18, 19, 20}
@@ -60,6 +68,21 @@ def safe_string(value: Any) -> str:
     return str(value).strip()
 
 
+@lru_cache(maxsize=1)
+def sheets_certificate_bundle() -> str:
+    """Combine public roots with Windows' trusted HTTPS certificates."""
+    if sys.platform != "win32":
+        return requests.certs.where()
+    certificates = Path(requests.certs.where()).read_text(encoding="ascii")
+    for store in ("ROOT", "CA"):
+        for certificate, encoding, trust in ssl.enum_certificates(store):
+            if encoding == "x509_asn" and (trust is True or "1.3.6.1.5.5.7.3.1" in trust):
+                certificates += ssl.DER_cert_to_PEM_cert(certificate)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", encoding="ascii", delete=False) as bundle:
+        bundle.write(certificates)
+        return bundle.name
+
+
 def load_sheet_data(
     worksheet_name: str,
     *,
@@ -76,11 +99,25 @@ def load_sheet_data(
         )
 
     credentials = Credentials.from_service_account_file(str(creds_path), scopes=SCOPES)
-    client = gspread.authorize(credentials)
-    spreadsheet = client.open_by_key(SHEET_ID)
-    worksheet = spreadsheet.worksheet(worksheet_name)
-
-    values = worksheet.get_all_values()
+    # Bound both credential refresh and Sheets requests; neither should wait forever.
+    auth_session = requests.Session()
+    auth_session.verify = sheets_certificate_bundle()
+    session = AuthorizedSession(credentials, refresh_timeout=20, auth_request=Request(session=auth_session))
+    session.verify = auth_session.verify
+    client = gspread.Client(auth=credentials, session=session)
+    client.set_timeout((10, 30))
+    try:
+        spreadsheet = client.open_by_key(SHEET_ID)
+        worksheet = spreadsheet.worksheet(worksheet_name)
+        values = worksheet.get_all_values()
+    except (Timeout, RequestsConnectionError, TransportError) as exc:
+        raise RuntimeError(
+            "No se pudo conectar con Google Sheets a tiempo. "
+            "Revisa tu conexión a Internet y pulsa Actualizar datos para volver a intentar."
+        ) from exc
+    finally:
+        session.close()
+        auth_session.close()
     if not values:
         return pd.DataFrame(), worksheet_name
 
@@ -140,6 +177,7 @@ def prepare_visitas_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             "70321862": "ERIKA UCHUYA TROCONES",
             "70122639": "JAVIER KLUIVERT CONDOR SANCHEZ",
             "71406087": "Ximena Jamilet Montoya Calderon",
+            "73498655": "Naomy Desyree Rivas Cubillas",
         }
         result["Nombre"] = result["Nombre"].map(
             lambda value: name_map.get(normalize_text(value), safe_string(value))
@@ -1945,7 +1983,8 @@ class RegistrosPanel(ctk.CTkFrame):
         self.date_refresh_button.configure(state="disabled")
         self.status_var.set("Consultando Google Sheets...")
         self._set_busy(True)
-        thread = threading.Thread(target=self._load_async, daemon=True)
+        # Read Tk variables on the UI thread before starting the network worker.
+        thread = threading.Thread(target=self._load_async, args=(self.sheet_var.get(),), daemon=True)
         thread.start()
 
     def export_excel(self) -> None:
@@ -1969,10 +2008,10 @@ class RegistrosPanel(ctk.CTkFrame):
         except Exception as exc:
             messagebox.showerror("Exportar Excel", f"No se pudo exportar el archivo.\n\n{exc}")
 
-    def _load_async(self) -> None:
+    def _load_async(self, worksheet_name: str = WORKSHEET_NAME) -> None:
         try:
             data, sheet_name = load_sheet_data(
-                self.sheet_var.get(),
+                worksheet_name,
                 filter_col_index=1,
                 allowed_values=ALLOWED_NAMES,
                 date_filter_col_index=9,
@@ -2163,6 +2202,7 @@ CRONOGRAMA_REPRESENTATIVES = {
     "70321862": "ERIKA UCHUYA TROCONES",
     "70122639": "JAVIER KLUIVERT CONDOR SANCHEZ",
     "71406087": "Ximena Jamilet Montoya Calderon",
+    "73498655": "Naomy Desyree Rivas Cubillas",
 }
 
 
@@ -2190,6 +2230,36 @@ def prepare_cronograma_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return result.loc[result["Fecha"].notna(), columns].reset_index(drop=True)
 
 
+def match_cronograma_visitas(cronograma: pd.DataFrame, visitas: pd.DataFrame) -> pd.DataFrame:
+    """Match raw Visita A/C/B/J against the prepared schedule, ignoring time."""
+    columns = [*cronograma.columns, "Fecha y hora de visita"]
+    if visitas.empty or cronograma.empty:
+        return pd.DataFrame(columns=columns)
+    if len(visitas.columns) < 10:
+        raise ValueError("La hoja Visita debe contener las columnas A a J para realizar el cruce.")
+    actual = visitas.iloc[:, [0, 2, 1, 9]].copy()
+    actual.columns = ["DNI", "Cliente", "Tipo de visita", "Fecha y hora de visita"]
+    planned = cronograma.copy()
+    keys = []
+    for column in ("DNI", "Cliente", "Tipo de visita"):
+        key = "_" + column
+        keys.append(key)
+        planned[key] = planned[column].map(normalize_text)
+        actual[key] = actual[column].map(normalize_text)
+    keys.append("_Fecha")
+    planned["_Fecha"] = planned["Fecha"]
+    actual["_Fecha"] = actual["Fecha y hora de visita"].map(
+        lambda value: pd.to_datetime(value, dayfirst=True, errors="coerce").date()
+        if safe_string(value) else pd.NaT
+    )
+    valid = actual[keys].notna().all(axis=1)
+    for key in keys[:-1]:
+        valid &= actual[key].ne("")
+    actual = actual.loc[valid, [*keys, "Fecha y hora de visita"]].drop_duplicates()
+    matched = planned.merge(actual, on=keys, how="inner", sort=False)
+    return matched.loc[:, columns]
+
+
 class CronogramaPanel(ctk.CTkFrame):
     MONTHS = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
               "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
@@ -2197,12 +2267,18 @@ class CronogramaPanel(ctk.CTkFrame):
     def __init__(self, master: Any) -> None:
         super().__init__(master, fg_color="#ffffff")
         self.selected_date = date.today()
+        self.show_selected_day = False
         self.month = self.selected_date.replace(day=1)
         self.base_df = prepare_cronograma_dataframe(pd.DataFrame())
         self.filtered_df = self.base_df.copy()
         self.queue: Queue = Queue()
         self.busy = False
         self.loaded = False
+        self.exporting = False
+        self.selected_date_from: date | None = None
+        self.selected_date_to: date | None = None
+        self.date_from_var = tk.StringVar(value="Todas")
+        self.date_to_var = tk.StringVar(value="Todas")
         self.representative_var = tk.StringVar(value="Todos")
         self.client_var = tk.StringVar()
         self.visit_type_var = tk.StringVar(value="Todos")
@@ -2223,7 +2299,9 @@ class CronogramaPanel(ctk.CTkFrame):
         header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(header, text="Cronograma", font=("Segoe UI", 20, "bold")).grid(row=0, column=0, sticky="w")
         self.refresh_button = ctk.CTkButton(header, text="Actualizar datos", command=self.refresh_data)
-        self.refresh_button.grid(row=0, column=1)
+        self.refresh_button.grid(row=0, column=1, padx=8)
+        self.export_button = ctk.CTkButton(header, text="Exportar Excel", command=self.export_excel)
+        self.export_button.grid(row=0, column=2)
         filters = ctk.CTkFrame(self, fg_color="#f8fafc")
         filters.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
         for col in range(3):
@@ -2239,6 +2317,14 @@ class CronogramaPanel(ctk.CTkFrame):
         self.type_combo = ttk.Combobox(filters, textvariable=self.visit_type_var, state="readonly", values=["Todos"])
         self.type_combo.grid(row=1, column=2, sticky="ew", padx=8, pady=(0, 8))
         ctk.CTkButton(filters, text="Limpiar filtros", command=self._clear_filters).grid(row=1, column=3, padx=8, pady=(0, 8))
+        date_filters = ctk.CTkFrame(filters, fg_color="transparent")
+        date_filters.grid(row=2, column=0, columnspan=4, sticky="ew", padx=8, pady=(0, 8))
+        for col, (label, variable, target) in enumerate((
+            ("Desde", self.date_from_var, "from"), ("Hasta", self.date_to_var, "to")
+        )):
+            ctk.CTkButton(date_filters, text=label, width=80,
+                          command=lambda value=target: self._open_calendar(value)).grid(row=0, column=col * 2, padx=(0, 8))
+            ctk.CTkEntry(date_filters, textvariable=variable, state="readonly", width=130).grid(row=0, column=col * 2 + 1, padx=(0, 16))
         calendar_container = ctk.CTkFrame(self, fg_color="#f8fafc")
         calendar_container.grid(row=2, column=0, sticky="ew", padx=16)
         calendar_container.grid_columnconfigure(1, weight=1)
@@ -2268,7 +2354,25 @@ class CronogramaPanel(ctk.CTkFrame):
         self.tree.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
         ctk.CTkLabel(self, textvariable=self.status_var).grid(row=5, column=0, sticky="w", padx=16, pady=6)
 
+    def _open_calendar(self, target: str) -> None:
+        picker = DateRangePicker(self, title="Fecha de cronograma",
+                                 start_date=self.selected_date_from, end_date=self.selected_date_to,
+                                 active_target=target)
+        self.wait_window(picker.top)
+        if picker.result is None:
+            return
+        self.selected_date_from, self.selected_date_to = picker.result
+        self.show_selected_day = False
+        self.date_from_var.set(self.selected_date_from.strftime("%d/%m/%Y") if self.selected_date_from else "Todas")
+        self.date_to_var.set(self.selected_date_to.strftime("%d/%m/%Y") if self.selected_date_to else "Todas")
+        self._apply_filters()
+
     def _clear_filters(self) -> None:
+        self.show_selected_day = False
+        self.selected_date_from = None
+        self.selected_date_to = None
+        self.date_from_var.set("Todas")
+        self.date_to_var.set("Todas")
         self.representative_var.set("Todos")
         self.client_var.set("")
         self.visit_type_var.set("Todos")
@@ -2284,7 +2388,11 @@ class CronogramaPanel(ctk.CTkFrame):
         visit_type = self.visit_type_var.get()
         if visit_type != "Todos":
             result = result.loc[result["Tipo de visita"].map(normalize_text).eq(normalize_text(visit_type))]
-        self.filtered_df = result
+        if self.selected_date_from:
+            result = result.loc[result["Fecha"].ge(self.selected_date_from)]
+        if self.selected_date_to:
+            result = result.loc[result["Fecha"].le(self.selected_date_to)]
+        self.filtered_df = result.sort_values("Fecha", kind="stable")
         self._render_calendar()
         self._render_detail()
 
@@ -2302,7 +2410,7 @@ class CronogramaPanel(ctk.CTkFrame):
                     continue
                 picked = self.month.replace(day=day)
                 count = counts.get(picked, 0)
-                selected = picked == self.selected_date
+                selected = self.show_selected_day and picked == self.selected_date
                 text = f"{day}" + (f" · {count} visita{'s' if count != 1 else ''}" if count else "")
                 ctk.CTkButton(self.calendar_frame, text=text, height=30,
                               fg_color="#1d4ed8" if selected else ("#dbeafe" if count else "#ffffff"),
@@ -2310,13 +2418,18 @@ class CronogramaPanel(ctk.CTkFrame):
                               command=lambda value=picked: self._select_day(value)).grid(row=row, column=col, sticky="ew", padx=2, pady=2)
 
     def _render_detail(self) -> None:
-        rows = self.filtered_df.loc[self.filtered_df["Fecha"].eq(self.selected_date)]
-        self.detail_var.set(f"Visitas del {self.selected_date:%d/%m/%Y}: {len(rows)}" + (" — Sin visitas programadas" if rows.empty else ""))
+        rows = self.filtered_df
+        period = f"Desde: {self.date_from_var.get()} / Hasta: {self.date_to_var.get()}" if self.selected_date_from or self.selected_date_to else "Todo el historial"
+        if self.show_selected_day:
+            rows = rows.loc[rows["Fecha"].eq(self.selected_date)]
+            period = f"Visitas del {self.selected_date:%d/%m/%Y}"
+        self.detail_var.set(f"{period}: {len(rows)} visitas programadas")
         self.tree.delete(*self.tree.get_children())
         for _, row in rows.iterrows():
             self.tree.insert("", "end", values=(row["Representante"], row["Cliente"], row["Tipo de visita"], row["Fecha"].strftime("%d/%m/%Y")))
 
     def _select_day(self, picked: date) -> None:
+        self.show_selected_day = True
         self.selected_date = picked
         self._render_calendar()
         self._render_detail()
@@ -2329,6 +2442,39 @@ class CronogramaPanel(ctk.CTkFrame):
     def _today(self) -> None:
         self.month = date.today().replace(day=1)
         self._select_day(date.today())
+
+    def export_excel(self) -> None:
+        if self.exporting:
+            return
+        if self.filtered_df.empty:
+            messagebox.showinfo("Exportar Excel", "No hay datos visibles para exportar.")
+            return
+        path = filedialog.asksaveasfilename(title="Guardar cronograma", defaultextension=".xlsx",
+                                          filetypes=[("Excel Workbook", "*.xlsx")],
+                                          initialfile="cronograma.xlsx")
+        if not path:
+            return
+        snapshot = self.filtered_df.copy()
+        self.exporting = True
+        self.export_button.configure(state="disabled", text="Exportando...")
+        self.status_var.set("Consultando Visita para cruzar y exportar los datos...")
+        threading.Thread(target=self._export_async, args=(path, snapshot), daemon=True).start()
+
+    def _export_async(self, path: str, snapshot: pd.DataFrame) -> None:
+        try:
+            visitas, _ = load_sheet_data("Visita", filter_col_index=0, allowed_values=CRONOGRAMA_REPRESENTATIVES)
+            matched = match_cronograma_visitas(snapshot, visitas)
+            with pd.ExcelWriter(path, engine="openpyxl", date_format="DD/MM/YYYY") as writer:
+                snapshot.to_excel(writer, sheet_name="Cronograma", index=False)
+                matched.to_excel(writer, sheet_name="Coincidencias", index=False)
+                for sheet in writer.sheets.values():
+                    sheet.freeze_panes = "A2"
+                    sheet.auto_filter.ref = sheet.dimensions
+                    for cells in sheet.columns:
+                        sheet.column_dimensions[cells[0].column_letter].width = min(55, max(14, max(len(safe_string(cell.value)) for cell in cells) + 2))
+            self.queue.put(("export_done", (path, len(snapshot), len(matched))))
+        except Exception as exc:
+            self.queue.put(("export_error", exc))
 
     def refresh_data(self) -> None:
         if self.busy:
@@ -2348,6 +2494,17 @@ class CronogramaPanel(ctk.CTkFrame):
     def _poll_queue(self) -> None:
         try:
             kind, payload = self.queue.get_nowait()
+            if kind in {"export_done", "export_error"}:
+                self.exporting = False
+                self.export_button.configure(state="normal", text="Exportar Excel")
+                if kind == "export_done":
+                    path, total, matches = payload
+                    self.status_var.set(f"Exportado: {total} registros y {matches} coincidencias.")
+                    messagebox.showinfo("Exportar Excel", f"Archivo guardado en:\n{path}\n\nCronograma: {total} registros\nCoincidencias: {matches}")
+                else:
+                    self.status_var.set("No se pudo exportar el cronograma.")
+                    messagebox.showerror("Exportar Excel", f"No se pudo exportar el archivo.\n\n{payload}")
+                return
             self.busy = False
             self.refresh_button.configure(state="normal", text="Actualizar datos")
             if kind == "data":
@@ -2459,8 +2616,9 @@ class ConsultaApp(ctk.CTk):
                 "ERIKA UCHUYA TROCONES",
                 "JAVIER KLUIVERT CONDOR SANCHEZ",
                 "Ximena Jamilet Montoya Calderon",
+                "Naomy Desyree Rivas Cubillas",
             ],
-            raw_filter_values=["70321862", "70122639", "71406087"],
+            raw_filter_values=["70321862", "70122639", "71406087", "73498655"],
             extra_filters=[
                 {
                     "kind": "autocomplete",
